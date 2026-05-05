@@ -7,21 +7,18 @@ from datetime import datetime
 import pandas as pd
 import os
 
-# ---------- SECURE API KEY LOADING (Cloud + Local) ----------
+# ---------- LOAD API KEYS (Cloud + Local) ----------
 try:
-    # Streamlit Cloud ke liye (Secrets)
     API_KEY = st.secrets["APCA_API_KEY_ID"]
     SECRET_KEY = st.secrets["APCA_API_SECRET_KEY"]
-    st.info("🔐 Using Streamlit Secrets (Cloud mode)")
+    st.info("🔑 Using Streamlit Secrets (Cloud mode)")
 except Exception:
-    # Local development ke liye (.env file)
     from dotenv import load_dotenv
     load_dotenv()
     API_KEY = os.getenv("APCA_API_KEY_ID")
     SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
     st.info("📁 Using .env file (Local mode)")
 
-# ---------- PAGE CONFIG ----------
 st.set_page_config(page_title="Real-Time Stock Dashboard", layout="wide")
 st.title("📈 Real-Time Stock & Forex Price Dashboard")
 st.markdown("### Live Real Market Data via Alpaca WebSocket | Price Alerts")
@@ -41,18 +38,17 @@ if "streaming" not in st.session_state:
     st.session_state.streaming = False
 if "data_source" not in st.session_state:
     st.session_state.data_source = "Demo"
-if "last_trade_time" not in st.session_state:
-    st.session_state.last_trade_time = None
+if "last_trade" not in st.session_state:
+    st.session_state.last_trade = None
 
 # Queue for thread-safe updates
 update_queue = queue.Queue()
 
-# ---------- SIDEBAR CONTROLS ----------
+# ---------- SIDEBAR ----------
 st.sidebar.header("🌐 Data Source")
 use_real = st.sidebar.checkbox("Use Real Alpaca Market Data", value=bool(API_KEY), disabled=not API_KEY)
 if not API_KEY:
-    st.sidebar.error("❌ API Keys Missing. Add to .env (local) or Streamlit Secrets (cloud).")
-    use_real = False
+    st.sidebar.error("❌ API Keys Missing. Add to Secrets (Cloud) or .env (Local).")
 
 st.sidebar.header("➕ Add Ticker")
 new_ticker = st.sidebar.text_input("Symbol", "").upper()
@@ -105,9 +101,9 @@ def update_alert_tab():
     else:
         alert_tab.info("No alerts triggered yet")
 
-# ---------- REAL WEBSOCKET WITH QUEUE ----------
-def real_stream_thread():
-    """Real Alpaca WebSocket using thread-safe queue"""
+# ---------- REAL THREAD (no session state access) ----------
+def real_stream_thread(symbols_list):
+    """Background thread: connects to Alpaca, pushes trades to queue"""
     try:
         from alpaca.data.live import StockDataStream
         from alpaca.data.models import Trade
@@ -116,80 +112,67 @@ def real_stream_thread():
         return
 
     def trade_callback(trade: Trade):
-        # Push to queue instead of direct session state
         update_queue.put(("trade", trade.symbol, trade.price))
 
     stream = StockDataStream(api_key=API_KEY, secret_key=SECRET_KEY)
-    for sym in st.session_state.symbols:
+    for sym in symbols_list:
         stream.subscribe_trades(trade_callback, sym)
-    
-    # Send a signal that real stream started
     update_queue.put(("status", "real_started"))
-    
     try:
-        stream.run()  # Blocking
+        stream.run()
     except Exception as e:
         update_queue.put(("error", str(e)))
 
-def demo_stream_thread():
-    """Fallback demo mode"""
-    while st.session_state.streaming and st.session_state.data_source == "Demo":
-        for sym in st.session_state.symbols:
-            old = st.session_state.prices.get(sym, 100)
-            if old == 0: old = 100
+def demo_stream_thread(symbols_list):
+    """Demo mode: random prices"""
+    while st.session_state.get("streaming", False):
+        for sym in symbols_list:
+            old = st.session_state.prices.get(sym, 100) if sym in st.session_state.prices else 100
+            if old == 0:
+                old = 100
             new_price = round(max(50, min(200, old + random.uniform(-2, 2))), 2)
             update_queue.put(("demo_price", sym, new_price))
         time.sleep(2)
 
-# ---------- STREAM CONTROL ----------
+# ---------- START / STOP ----------
 if start_clicked and not st.session_state.streaming:
     st.session_state.streaming = True
     st.session_state.triggered.clear()
-    st.session_state.data_source = "Demo"  # default until real confirms
-    st.session_state.last_trade_time = None
-    
+    st.session_state.data_source = "Demo"
+    st.session_state.last_trade = None
+    # Clear old queue items
+    while not update_queue.empty():
+        try: update_queue.get_nowait()
+        except: pass
+
     if use_real and API_KEY:
-        try:
-            t = threading.Thread(target=real_stream_thread, daemon=True)
-            t.start()
-            st.success("Connecting to Alpaca real market data...")
-        except Exception as e:
-            st.error(f"Real stream error: {e}")
-            # fallback to demo
-            t = threading.Thread(target=demo_stream_thread, daemon=True)
-            t.start()
-    else:
-        t = threading.Thread(target=demo_stream_thread, daemon=True)
+        t = threading.Thread(target=real_stream_thread, args=(st.session_state.symbols.copy(),), daemon=True)
         t.start()
-    
+        st.success("Connecting to Alpaca real data...")
+    else:
+        t = threading.Thread(target=demo_stream_thread, args=(st.session_state.symbols.copy(),), daemon=True)
+        t.start()
     st.rerun()
 
 if stop_clicked and st.session_state.streaming:
     st.session_state.streaming = False
     st.session_state.data_source = "Demo"
-    # clear queue
-    while not update_queue.empty():
-        try: update_queue.get_nowait()
-        except: pass
     st.rerun()
 
-# ---------- PROCESS QUEUE (every rerun) ----------
+# ---------- PROCESS QUEUE (main thread) ----------
 if st.session_state.streaming:
     try:
-        # process up to 100 messages per cycle
         for _ in range(100):
             item = update_queue.get_nowait()
             if item[0] == "trade":
                 _, sym, price = item
                 price = round(price, 2)
                 st.session_state.prices[sym] = price
-                st.session_state.last_trade_time = time.time()
+                st.session_state.last_trade = time.time()
                 st.session_state.data_source = "Real"
-                # alert check
                 if sym in st.session_state.alerts:
                     if price > st.session_state.alerts[sym] and sym not in st.session_state.triggered:
                         st.session_state.triggered.add(sym)
-                # history
                 st.session_state.history.append({
                     "timestamp": datetime.now().strftime("%H:%M:%S"),
                     "symbol": sym,
@@ -200,7 +183,6 @@ if st.session_state.streaming:
             elif item[0] == "demo_price":
                 _, sym, price = item
                 st.session_state.prices[sym] = price
-                # alert check same as above
                 if sym in st.session_state.alerts:
                     if price > st.session_state.alerts[sym] and sym not in st.session_state.triggered:
                         st.session_state.triggered.add(sym)
@@ -212,28 +194,26 @@ if st.session_state.streaming:
             elif item[0] == "status" and item[1] == "real_started":
                 st.session_state.data_source = "Real"
             elif item[0] == "error":
-                st.error(f"WebSocket error: {item[1]}")
+                st.error(f"Connection error: {item[1]}")
                 st.session_state.data_source = "Demo"
     except queue.Empty:
         pass
-    
-    # Auto-fallback if no trade for 15 seconds (real mode stuck)
-    if st.session_state.data_source == "Real" and st.session_state.last_trade_time:
-        if time.time() - st.session_state.last_trade_time > 15:
+
+    # Auto fallback to demo if no real data for 20 seconds
+    if st.session_state.data_source == "Real" and st.session_state.last_trade:
+        if time.time() - st.session_state.last_trade > 20:
             st.session_state.data_source = "Demo"
-            st.warning("No real data for 15 seconds. Switching to demo mode.")
-            # start demo thread if not already
-            # (simple flag – but for now just rely on existing demo? Actually we need a demo thread)
-            # Let's just set data_source to Demo and demo thread will start automatically next rerun? 
-            # To keep it simple, we can start a demo thread here. But we'll add a check.
-            # For brevity, I'll assume demo thread is already running as fallback.
+            st.warning("No real data for 20s. Switching to demo mode.")
+            # Start a demo thread if not already? The demo thread will be started only if use_real=False; here we are in real mode but stuck, so we need to start demo thread manually? Simpler: just keep demo data from the existing demo thread? Actually we only have one thread. Better: just set data_source to Demo and let existing thread continue? But the thread is real_stream_thread which is stuck. We need to launch a demo thread. For simplicity, we can just rely on the next start. But user can stop/start. I'll add a fallback thread start.
+            if not any(isinstance(t, threading.Thread) and t.name.startswith("Demo") for t in threading.enumerate()):
+                demo_th = threading.Thread(target=demo_stream_thread, args=(st.session_state.symbols.copy(),), daemon=True)
+                demo_th.start()
 
 # ---------- DISPLAY ----------
 if st.session_state.streaming:
     source_display = "Real Alpaca Market Data" if st.session_state.data_source == "Real" else "Demo Mode (Simulated)"
     color = "🟢" if st.session_state.data_source == "Real" else "🟡"
     status_placeholder.success(f"{color} STREAMING ACTIVE - Source: {source_display}")
-    
     for sym, placeholder in placeholders.items():
         price = st.session_state.prices.get(sym, 0)
         if price > 0:
@@ -241,7 +221,6 @@ if st.session_state.streaming:
             placeholder.metric(icon + sym, f"${price:.2f}", delta="live")
         else:
             placeholder.metric(sym, "Waiting...")
-    
     if st.session_state.triggered:
         alert_placeholder.warning(f"🔔 ALERT: {list(st.session_state.triggered)[-1]} crossed threshold!")
 else:
