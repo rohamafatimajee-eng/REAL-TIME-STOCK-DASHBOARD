@@ -1,27 +1,19 @@
 import streamlit as st
 import time
 import random
-import threading
-import queue
-import asyncio
 from datetime import datetime
 import pandas as pd
 import os
 
-# ---------- API KEYS (Cloud first, then .env) ----------
+# ---------- API KEYS (optional, sirf real mode ke liye) ----------
 try:
     API_KEY = st.secrets["APCA_API_KEY_ID"]
     SECRET_KEY = st.secrets["APCA_API_SECRET_KEY"]
-    st.sidebar.success("✅ Using Streamlit Secrets")
 except:
     from dotenv import load_dotenv
     load_dotenv()
     API_KEY = os.getenv("APCA_API_KEY_ID")
     SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-    if API_KEY:
-        st.sidebar.success("✅ Using .env file")
-    else:
-        st.sidebar.error("❌ No API keys found")
 
 st.set_page_config(page_title="Real-Time Dashboard", layout="wide")
 st.title("📈 Real-Time Stock Dashboard")
@@ -31,7 +23,8 @@ st.markdown("### Live Prices | Alerts | Add Tickers")
 if "symbols" not in st.session_state:
     st.session_state.symbols = ["AAPL","MSFT","GOOGL","AMZN","TSLA","META","NFLX","NVDA"]
 if "prices" not in st.session_state:
-    st.session_state.prices = {s: 0.0 for s in st.session_state.symbols}
+    # Initialize with random prices so they show immediately
+    st.session_state.prices = {s: round(random.uniform(90, 110), 2) for s in st.session_state.symbols}
 if "alerts" not in st.session_state:
     st.session_state.alerts = {}
 if "triggered" not in st.session_state:
@@ -40,18 +33,22 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "streaming" not in st.session_state:
     st.session_state.streaming = False
-if "source" not in st.session_state:
-    st.session_state.source = "Demo"
-
-# Queue for thread-safe updates
-data_queue = queue.Queue()
+if "last_update" not in st.session_state:
+    st.session_state.last_update = time.time()
+if "use_real" not in st.session_state:
+    st.session_state.use_real = False
 
 # ---------- SIDEBAR ----------
+st.sidebar.header("🌐 Data Source")
+st.session_state.use_real = st.sidebar.checkbox("Use Real Alpaca", value=False, disabled=not API_KEY)
+if not API_KEY:
+    st.sidebar.warning("No API keys - Demo only")
+
 st.sidebar.header("➕ Add Ticker")
 new_sym = st.sidebar.text_input("Symbol", "").upper()
 if st.sidebar.button("Add") and new_sym and new_sym not in st.session_state.symbols:
     st.session_state.symbols.append(new_sym)
-    st.session_state.prices[new_sym] = 0.0
+    st.session_state.prices[new_sym] = 100.0
     st.rerun()
 if st.sidebar.button("Remove Last") and len(st.session_state.symbols) > 1:
     removed = st.session_state.symbols.pop()
@@ -67,124 +64,48 @@ if st.sidebar.button("Clear Alerts"):
     st.session_state.alerts.clear()
     st.session_state.triggered.clear()
 
-# ---------- REAL ALPACA THREAD (async callback) ----------
-def real_worker(symbols_copy):
-    """Background thread for Alpaca WebSocket"""
-    async def trade_callback(trade):
-        # This runs in asyncio event loop, push to queue
-        data_queue.put(("real", trade.symbol, trade.price))
-    
-    try:
-        from alpaca.data.live import StockDataStream
-        stream = StockDataStream(api_key=API_KEY, secret_key=SECRET_KEY)
-        for sym in symbols_copy:
-            stream.subscribe_trades(trade_callback, sym)
-        data_queue.put(("status", "real_connected"))
-        # Run the stream (blocking)
-        stream.run()
-    except Exception as e:
-        data_queue.put(("error", str(e)))
-
-# ---------- DEMO THREAD (no async, just random) ----------
-def demo_worker(symbols_copy):
-    """Generates random prices and pushes to queue"""
-    # Start with base prices
-    prices = {sym: 100.0 for sym in symbols_copy}
-    while True:
-        # Check if streaming flag is still True (read from shared variable? but thread-safe)
-        # We'll read from a global flag; to avoid conflict, we can check a simple variable
-        # Since we can't access session_state, we'll use a module-level flag set by main thread
-        if not getattr(demo_worker, "running", False):
-            break
-        for sym in symbols_copy:
-            change = random.uniform(-2, 2)
-            prices[sym] = max(50, min(200, prices[sym] + change))
-            data_queue.put(("demo", sym, round(prices[sym], 2)))
-        time.sleep(2)
-
-# ---------- START / STOP BUTTONS ----------
+# ---------- CONTROL BUTTONS ----------
 col1, col2 = st.columns(2)
 with col1:
-    start_clicked = st.button("▶️ START STREAMING", type="primary")
+    if st.button("▶️ START STREAMING", type="primary"):
+        st.session_state.streaming = True
+        st.session_state.last_update = time.time()
+        st.rerun()
 with col2:
-    stop_clicked = st.button("⏹️ STOP STREAMING")
+    if st.button("⏹️ STOP STREAMING"):
+        st.session_state.streaming = False
+        st.rerun()
 
-if start_clicked and not st.session_state.streaming:
-    st.session_state.streaming = True
-    st.session_state.triggered.clear()
-    st.session_state.source = "Demo"
-    # Clear old queue
-    while not data_queue.empty():
-        try: data_queue.get_nowait()
-        except: pass
-    
-    # Decide real or demo
-    use_real = st.sidebar.checkbox("Use Real Alpaca", value=bool(API_KEY), key="real_toggle")
-    if use_real and API_KEY:
-        # Start real thread
-        t = threading.Thread(target=real_worker, args=(st.session_state.symbols.copy(),), daemon=True)
-        t.start()
-    else:
-        # Start demo thread with a running flag
-        demo_worker.running = True
-        t = threading.Thread(target=demo_worker, args=(st.session_state.symbols.copy(),), daemon=True)
-        t.start()
-    st.rerun()
-
-if stop_clicked and st.session_state.streaming:
-    st.session_state.streaming = False
-    # Signal demo thread to stop
-    if hasattr(demo_worker, "running"):
-        demo_worker.running = False
-    st.rerun()
-
-# ---------- PROCESS QUEUE (main thread) ----------
+# ---------- UPDATE PRICES (NO THREADS) ----------
 if st.session_state.streaming:
-    # Process up to 200 messages per refresh
-    for _ in range(200):
-        try:
-            typ, *vals = data_queue.get_nowait()
-            if typ == "real":
-                _, sym, price = typ, vals[0], vals[1]
-                price = round(price, 2)
-                st.session_state.prices[sym] = price
-                st.session_state.source = "Real"
-                # alert check
-                if sym in st.session_state.alerts and price > st.session_state.alerts[sym]:
-                    if sym not in st.session_state.triggered:
-                        st.session_state.triggered.add(sym)
-                # history
-                st.session_state.history.append({
-                    "t": datetime.now().strftime("%H:%M:%S"),
-                    "s": sym,
-                    "p": price
-                })
-                if len(st.session_state.history) > 500:
-                    st.session_state.history = st.session_state.history[-500:]
-            elif typ == "demo":
-                _, sym, price = typ, vals[0], vals[1]
-                st.session_state.prices[sym] = price
-                if sym in st.session_state.alerts and price > st.session_state.alerts[sym]:
-                    if sym not in st.session_state.triggered:
-                        st.session_state.triggered.add(sym)
-                st.session_state.history.append({
-                    "t": datetime.now().strftime("%H:%M:%S"),
-                    "s": sym,
-                    "p": price
-                })
-                if len(st.session_state.history) > 500:
-                    st.session_state.history = st.session_state.history[-500:]
-            elif typ == "status":
-                if vals[0] == "real_connected":
-                    st.session_state.source = "Real"
-            elif typ == "error":
-                st.error(f"Alpaca error: {vals[0]}")
-                st.session_state.source = "Demo"
-        except queue.Empty:
-            break
+    now = time.time()
+    if now - st.session_state.last_update >= 2.0:
+        # Update each symbol with random walk (demo mode)
+        # For real mode, you'd call an API here, but for now simple demo
+        for sym in st.session_state.symbols:
+            old = st.session_state.prices.get(sym, 100)
+            change = random.uniform(-2, 2)
+            new_price = round(max(50, min(200, old + change)), 2)
+            st.session_state.prices[sym] = new_price
+            
+            # Alert check
+            if sym in st.session_state.alerts and new_price > st.session_state.alerts[sym]:
+                if sym not in st.session_state.triggered:
+                    st.session_state.triggered.add(sym)
+            
+            # History
+            st.session_state.history.append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "symbol": sym,
+                "price": new_price
+            })
+            if len(st.session_state.history) > 500:
+                st.session_state.history = st.session_state.history[-500:]
+        
+        st.session_state.last_update = now
+        st.rerun()  # Refresh UI after update
 
 # ---------- UI DISPLAY ----------
-# Create dynamic columns
 cols = st.columns(4)
 placeholders = {}
 for i, sym in enumerate(st.session_state.symbols):
@@ -194,21 +115,21 @@ status_placeholder = st.empty()
 alert_placeholder = st.empty()
 
 if st.session_state.streaming:
-    source_text = "Real Alpaca" if st.session_state.source == "Real" else "Demo (random)"
-    status_placeholder.success(f"🟢 STREAMING ACTIVE - Source: {source_text}")
+    status_placeholder.success("🟢 STREAMING ACTIVE - Demo Mode (updates every 2 sec)")
     for sym, ph in placeholders.items():
         price = st.session_state.prices.get(sym, 0)
-        if price > 0:
-            icon = "🔔 " if sym in st.session_state.alerts else ""
-            ph.metric(icon + sym, f"${price:.2f}")
-        else:
-            ph.metric(sym, "Waiting...")
+        icon = "🔔 " if sym in st.session_state.alerts else ""
+        ph.metric(icon + sym, f"${price:.2f}")
     if st.session_state.triggered:
-        alert_placeholder.warning(f"🔔 Alert: {list(st.session_state.triggered)[-1]} crossed threshold!")
+        alert_placeholder.warning(f"🔔 ALERT: {list(st.session_state.triggered)[-1]} crossed!")
 else:
     status_placeholder.info("⚡ Click START STREAMING")
     for sym, ph in placeholders.items():
-        ph.metric(sym, "Paused")
+        price = st.session_state.prices.get(sym, 0)
+        if price == 0:
+            ph.metric(sym, "Paused")
+        else:
+            ph.metric(sym, f"${price:.2f}")
 
 # Alert history expander
 with st.expander("🔔 Alert History"):
@@ -224,8 +145,3 @@ with st.expander("📜 Export Data"):
             df = pd.DataFrame(st.session_state.history)
             st.download_button("Download", df.to_csv(index=False), "prices.csv")
     st.dataframe(pd.DataFrame(st.session_state.history[-20:]) if st.session_state.history else pd.DataFrame())
-
-# Auto-rerun every 1 second while streaming
-if st.session_state.streaming:
-    time.sleep(1)
-    st.rerun()
